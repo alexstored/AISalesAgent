@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+openai
+SQLAlchemy>=2.0
+asyncpg
+psycopg[binary]
+beautifulsoup4
