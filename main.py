@@ -3,13 +3,16 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import httpx
+import trafilatura
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from playwright.async_api import async_playwright
 
 from openai import OpenAI
 
@@ -46,7 +49,7 @@ HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID = os.getenv("HUBSPOT_NOTE_TO_CONTACT_ASSOC
 # =========================
 # App + CORS
 # =========================
-app = FastAPI(title="StoredAI Backend", version="0.1.0")
+app = FastAPI(title="StoredAI Backend", version="0.2.0")
 
 origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip() and "*" not in o]
 origin_regex = r"^https://.*\.vercel\.app$"
@@ -138,6 +141,62 @@ def safe_domain(url: str) -> str:
     return url
 
 
+async def fetch_rendered_html(url: str) -> str:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(user_agent=USER_AGENT)
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        html = await page.content()
+        await browser.close()
+        return html
+
+
+def extract_internal_links(html: str, base_url: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    base_host = urlparse(base_url).netloc
+    links = []
+
+    keywords = [
+        "about", "service", "services", "product", "products", "pricing",
+        "menu", "book", "booking", "reservation", "contact", "faq",
+        "order", "delivery", "checkout", "shop", "payments", "pay",
+        "invoice", "subscriptions", "plans"
+    ]
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full = urljoin(base_url, href)
+        parsed = urlparse(full)
+
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if parsed.netloc != base_host:
+            continue
+
+        path = parsed.path.lower()
+        if any(k in path for k in keywords):
+            links.append(full)
+
+    deduped = []
+    seen = set()
+    for link in links:
+        if link not in seen:
+            seen.add(link)
+            deduped.append(link)
+
+    return deduped[:8]
+
+
+def extract_main_text(html: str, url: str) -> str:
+    text = trafilatura.extract(
+        html,
+        url=url,
+        favor_precision=True,
+        include_comments=False,
+    )
+    return (text or "").strip()
+
+
 # =========================
 # HubSpot API helpers
 # =========================
@@ -150,10 +209,6 @@ def hubspot_headers() -> Dict[str, str]:
 
 
 async def hubspot_search_contact_by_phone(phone_raw: str) -> Optional[Dict[str, Any]]:
-    """
-    Search HubSpot contacts by phone using simple exact searches first.
-    Returns the first matching result or None.
-    """
     e164, digits, last10 = normalize_phone(phone_raw)
     if not digits:
         return None
@@ -419,6 +474,14 @@ class WebsiteIntelResponse(BaseModel):
     extracted_preview: Optional[str] = None
 
 
+class WebsiteDeepIntelResponse(BaseModel):
+    url: str
+    scanned_pages: List[str]
+    bullets: List[str]
+    payment_clues: List[str] = []
+    provider_mentions: List[str] = []
+
+
 class AdviceRequest(BaseModel):
     call_notes: str = Field("", description="Free-form notes captured during the call")
     website_bullets: List[str] = Field(default_factory=list)
@@ -582,8 +645,19 @@ async def website_intelligence(req: WebsiteIntelRequest):
         return WebsiteIntelResponse(url=url, bullets=fallback_bullets[:4], extracted_preview=extracted[:600])
 
     prompt = f"""
-You are an analyst. From the website text below, infer the business type and what they sell/do.
-Return 3-4 concise bullet points (max 14 words each). No fluff.
+You are a commercial analyst helping a payments sales agent prepare for a live call.
+
+From the website text below, return 3-4 concise bullet points covering:
+1. What the business does / sells
+2. Their likely customer type or operating model
+3. Anything relevant to card payments, ecommerce, bookings, subscriptions, takeaway, in-person payments, POS, checkout, invoices, or recurring billing
+4. Any mention or clue of an existing payment provider, gateway, checkout platform, or payment method shown on the site
+
+Rules:
+- Be commercially useful
+- Keep each bullet concise (max 18 words)
+- Only mention payment providers if supported by the website text
+- Do not invent facts
 
 Return ONLY valid JSON like:
 {{"bullets": ["...", "..."]}}
@@ -608,6 +682,80 @@ WEBSITE_TEXT:
         return WebsiteIntelResponse(url=url, bullets=bullets, extracted_preview=extracted[:600])
     except Exception:
         return WebsiteIntelResponse(url=url, bullets=fallback_bullets[:4], extracted_preview=extracted[:600])
+
+
+@app.post("/intel/website/deep", response_model=WebsiteDeepIntelResponse)
+async def website_intelligence_deep(req: WebsiteIntelRequest):
+    if not openai_client:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured on server.")
+
+    root_url = safe_domain(req.url)
+
+    try:
+        home_html = await fetch_rendered_html(root_url)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to load homepage: {e}")
+
+    internal_links = extract_internal_links(home_html, root_url)
+    pages_to_scan = [root_url] + internal_links[:6]
+
+    page_texts = []
+    scanned_pages = []
+
+    for page_url in pages_to_scan:
+        try:
+            html = await fetch_rendered_html(page_url)
+            text = extract_main_text(html, page_url)
+            if text:
+                scanned_pages.append(page_url)
+                page_texts.append(f"URL: {page_url}\n{text[:4000]}")
+        except Exception as e:
+            print(f"[deep-intel] Failed on {page_url}: {e}")
+
+    combined_text = "\n\n".join(page_texts)[:20000]
+
+    prompt = f"""
+You are a commercial analyst helping a payments sales agent prepare for a live call.
+
+From the website text below, return JSON with:
+- bullets: 3-4 concise bullets on what the business does, sells, and how it likely takes payments
+- payment_clues: visible clues about in-person payments, ecommerce, bookings, subscriptions, invoicing, takeaway, delivery, checkout, POS, etc.
+- provider_mentions: only payment providers or platforms explicitly mentioned or strongly evidenced in the text
+
+Rules:
+- Do not invent facts
+- Only mention providers if supported by the text
+- Keep bullets concise and commercially useful
+
+Return ONLY valid JSON like:
+{{
+  "bullets": ["...", "..."],
+  "payment_clues": ["...", "..."],
+  "provider_mentions": ["...", "..."]
+}}
+
+WEBSITE_TEXT:
+{combined_text}
+""".strip()
+
+    try:
+        resp = openai_client.responses.create(
+            model=AI_MODEL,
+            input=prompt,
+            temperature=0.2,
+        )
+        raw = (resp.output_text or "").strip()
+        parsed = json.loads(raw)
+
+        return WebsiteDeepIntelResponse(
+            url=root_url,
+            scanned_pages=scanned_pages,
+            bullets=parsed.get("bullets", [])[:4],
+            payment_clues=parsed.get("payment_clues", [])[:6],
+            provider_mentions=parsed.get("provider_mentions", [])[:6],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Deep intel AI failed: {e}")
 
 
 @app.post("/ai/advice", response_model=AdviceResponse)
@@ -636,9 +784,11 @@ Optional extra:
 {extra}
 
 Rules:
-- Bullets should be actionable and specific (not generic).
-- Mention 1 strong question the agent should ask.
-- Keep each bullet <= 18 words.
+- Bullets should be actionable and specific (not generic)
+- Mention 1 strong question the agent should ask
+- Keep each bullet <= 18 words
+- If relevant, position Worldpay strongly against the current provider
+
 Return ONLY valid JSON like:
 {{"bullets": ["...", "..."]}}
 """.strip()
