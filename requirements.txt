@@ -6,3 +6,7 @@ SQLAlchemy>=2.0
 asyncpg
 psycopg[binary]
 beautifulsoup4
+trafilatura
+playwright
+beautifulsoup4
+httpx
