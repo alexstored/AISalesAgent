@@ -33,7 +33,7 @@ CT_STATE_API_BASE = os.getenv(
 # --- CORS (allow your Vercel app + localhost) ---
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:3000,https://*.vercel.app",
+    "http://localhost:3000",
 )
 
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "12"))
@@ -57,11 +57,16 @@ HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID = os.getenv("HUBSPOT_NOTE_TO_CONTACT_ASSOC
 # =========================
 app = FastAPI(title="StoredAI Backend", version="0.1.0")
 
-# Convert CSV -> list; keep simple wildcard support for vercel preview
-origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+# Explicit origins from env
+origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip() and "*" not in o]
+
+# Regex for Vercel preview/prod domains
+origin_regex = r"^https://.*\.vercel\.app$"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins if origins else ["*"],
+    allow_origins=origins if origins else ["http://localhost:3000"],
+    allow_origin_regex=origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -85,7 +90,6 @@ def normalize_phone(raw: str) -> Tuple[str, str, str]:
     if raw.startswith("+"):
         e164 = "+" + digits
     else:
-        # best effort: if UK numbers coming without '+', you might need better logic later
         e164 = "+" + digits if digits else ""
 
     last10 = digits[-10:] if len(digits) >= 10 else digits
@@ -108,7 +112,6 @@ async def http_get_text(url: str, headers: Optional[Dict[str, str]] = None) -> s
 def extract_site_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    # Remove noisy tags
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
 
@@ -118,7 +121,6 @@ def extract_site_text(html: str) -> str:
     if meta and meta.get("content"):
         meta_desc = meta["content"].strip()
 
-    # Grab headings and some body text
     headings = []
     for h in soup.find_all(["h1", "h2", "h3"]):
         txt = h.get_text(" ", strip=True)
@@ -175,17 +177,13 @@ async def hubspot_search_contact_by_phone(phone_raw: str) -> Optional[Dict[str, 
 
     url = "https://api.hubapi.com/crm/v3/objects/contacts/search"
 
-    # HubSpot search supports OR across filterGroups, AND within group.
-    # We'll OR across fields & match styles.
     filter_groups = []
 
-    # Exact matches
     for prop in ["phone", "mobilephone"]:
         if e164:
             filter_groups.append({"filters": [{"propertyName": prop, "operator": "EQ", "value": e164}]})
         filter_groups.append({"filters": [{"propertyName": prop, "operator": "EQ", "value": digits}]})
 
-    # Token contains (useful if formatting differs)
     for prop in ["phone", "mobilephone"]:
         filter_groups.append({"filters": [{"propertyName": prop, "operator": "CONTAINS_TOKEN", "value": last10}]})
 
@@ -280,10 +278,6 @@ async def hubspot_get_company(company_id: str) -> Dict[str, Any]:
 
 
 async def hubspot_create_note(note_body_html: str) -> Dict[str, Any]:
-    """
-    Creates a Note object in HubSpot. Association to contact is optional and may
-    require associationTypeId (portal-specific).
-    """
     url = "https://api.hubapi.com/crm/v3/objects/notes"
     payload = {
         "properties": {
@@ -298,10 +292,6 @@ async def hubspot_create_note(note_body_html: str) -> Dict[str, Any]:
 
 
 async def hubspot_associate_note_to_contact(note_id: str, contact_id: str) -> None:
-    """
-    Optional. Requires association type id, which can vary.
-    If you don't know it yet, skip association for now and just store note ID.
-    """
     assoc_type_id = HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID
     if not assoc_type_id:
         return
@@ -359,7 +349,7 @@ class PullCallEnrichedResponse(BaseModel):
     call: PullCallResponse
     hubspot_contact: Optional[HubSpotContact] = None
     hubspot_company: Optional[HubSpotCompany] = None
-    website: Optional[str] = None  # derived best website/domain to scan
+    website: Optional[str] = None
 
 
 class WebsiteIntelRequest(BaseModel):
@@ -369,14 +359,14 @@ class WebsiteIntelRequest(BaseModel):
 class WebsiteIntelResponse(BaseModel):
     url: str
     bullets: List[str]
-    extracted_preview: Optional[str] = None  # helpful for debugging
+    extracted_preview: Optional[str] = None
 
 
 class AdviceRequest(BaseModel):
     call_notes: str = Field("", description="Free-form notes captured during the call")
     website_bullets: List[str] = Field(default_factory=list)
     provider: Optional[str] = None
-    pricing_context: Optional[str] = None  # e.g. "AOV £45, MCT £10, terminals 2"
+    pricing_context: Optional[str] = None
     extra_context: Optional[str] = None
 
 
@@ -412,9 +402,6 @@ def health():
 
 @app.get("/call/current", response_model=PullCallResponse)
 async def get_current_call(agent_id: str = Query(..., min_length=1)):
-    """
-    Pull current call state from your existing Render call-state service.
-    """
     url = f"{CT_STATE_API_BASE}/agents/{agent_id}/current-call"
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         r = await client.get(url)
@@ -425,12 +412,6 @@ async def get_current_call(agent_id: str = Query(..., min_length=1)):
 
 @app.get("/call/pull", response_model=PullCallEnrichedResponse)
 async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
-    """
-    1) Pull current call from CT_STATE_API_BASE
-    2) If active + external_number -> search HubSpot contact
-    3) Pull full contact + associated company
-    4) Return combined payload for your UI
-    """
     call = await get_current_call(agent_id)
 
     if not call.active or not call.external_number:
@@ -438,10 +419,8 @@ async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
 
     require_env("HUBSPOT_PRIVATE_APP_TOKEN", HUBSPOT_PRIVATE_APP_TOKEN)
 
-    # Search contact by phone
     found = await hubspot_search_contact_by_phone(call.external_number)
     if not found:
-        # Return call only; UI can show number + "no match"
         return PullCallEnrichedResponse(call=call, website=None)
 
     contact_id = found.get("id")
@@ -462,7 +441,6 @@ async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
         country=props.get("country"),
     )
 
-    # Pull company if associated
     company = None
     website = contact.website or None
 
@@ -497,11 +475,6 @@ async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
 
 @app.post("/intel/website", response_model=WebsiteIntelResponse)
 async def website_intelligence(req: WebsiteIntelRequest):
-    """
-    Fetches and extracts website text, returns 3-4 bullets describing business type/offer.
-    If INTEL_USE_AI=true and OpenAI key present, it will AI-summarise.
-    Otherwise returns heuristic bullets (title/desc/headings).
-    """
     url = safe_domain(req.url)
 
     headers = {"User-Agent": USER_AGENT}
@@ -512,7 +485,6 @@ async def website_intelligence(req: WebsiteIntelRequest):
 
     extracted = extract_site_text(html)
 
-    # Non-AI bullets fallback
     fallback_bullets = []
     for line in extracted.splitlines():
         if line.startswith("TITLE:"):
@@ -525,9 +497,14 @@ async def website_intelligence(req: WebsiteIntelRequest):
             fallback_bullets.extend(hs[:2])
         if len(fallback_bullets) >= 4:
             break
+
     fallback_bullets = [b for b in fallback_bullets if b][:4]
     if not fallback_bullets:
-        fallback_bullets = ["Business website detected.", "No clear description found.", "Try scanning the About page."]
+        fallback_bullets = [
+            "Business website detected.",
+            "No clear description found.",
+            "Try scanning the About page.",
+        ]
 
     if not (INTEL_USE_AI and openai_client):
         return WebsiteIntelResponse(url=url, bullets=fallback_bullets[:4], extracted_preview=extracted[:600])
@@ -558,18 +535,11 @@ WEBSITE_TEXT:
         bullets = bullets[:4]
         return WebsiteIntelResponse(url=url, bullets=bullets, extracted_preview=extracted[:600])
     except Exception:
-        # Fall back gracefully
         return WebsiteIntelResponse(url=url, bullets=fallback_bullets[:4], extracted_preview=extracted[:600])
 
 
 @app.post("/ai/advice", response_model=AdviceResponse)
 async def get_sales_advice(req: AdviceRequest):
-    """
-    Uses OpenAI to produce 2-3 actionable sales bullets based on:
-    - call notes
-    - website intelligence bullets
-    - provider/pricing context
-    """
     if not openai_client:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured on server.")
 
@@ -622,13 +592,8 @@ Return ONLY valid JSON like:
 
 @app.post("/hubspot/notes", response_model=SaveNotesResponse)
 async def save_notes_to_hubspot(req: SaveNotesRequest):
-    """
-    Saves notes into HubSpot as a Note object.
-    Association to contact is optional (depends on associationTypeId availability).
-    """
     require_env("HUBSPOT_PRIVATE_APP_TOKEN", HUBSPOT_PRIVATE_APP_TOKEN)
 
-    # Store as simple HTML note body. You can enrich format later.
     body_html = f"""
 <p><strong>Call UUID:</strong> {req.call_uuid or ""}</p>
 <p><strong>Notes:</strong></p>
@@ -644,7 +609,6 @@ async def save_notes_to_hubspot(req: SaveNotesRequest):
             await hubspot_associate_note_to_contact(note_id, req.contact_id)
             associated = bool(HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID)
         except Exception:
-            # association is optional; don't fail the whole request
             associated = False
 
     return SaveNotesResponse(ok=True, note_id=note_id, associated=associated)
