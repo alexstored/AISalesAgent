@@ -146,9 +146,8 @@ async def fetch_rendered_html(url: str) -> str:
         browser = await p.chromium.launch(channel="chromium", headless=True)
         try:
             page = await browser.new_page(user_agent=USER_AGENT)
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            html = await page.content()
-            return html
+            await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+            return await page.content()
         finally:
             await browser.close()
 
@@ -644,7 +643,11 @@ async def website_intelligence(req: WebsiteIntelRequest):
         ]
 
     if not (INTEL_USE_AI and openai_client):
-        return WebsiteIntelResponse(url=url, bullets=fallback_bullets[:4], extracted_preview=extracted[:600])
+        return WebsiteIntelResponse(
+            url=url,
+            bullets=fallback_bullets[:4],
+            extracted_preview=extracted[:600],
+        )
 
     prompt = f"""
 You are a commercial analyst helping a payments sales agent prepare for a live call.
@@ -681,9 +684,17 @@ WEBSITE_TEXT:
             raise ValueError("AI returned no bullets")
         bullets = [str(b).strip().lstrip("-•").strip() for b in bullets if str(b).strip()]
         bullets = bullets[:4]
-        return WebsiteIntelResponse(url=url, bullets=bullets, extracted_preview=extracted[:600])
+        return WebsiteIntelResponse(
+            url=url,
+            bullets=bullets,
+            extracted_preview=extracted[:600],
+        )
     except Exception:
-        return WebsiteIntelResponse(url=url, bullets=fallback_bullets[:4], extracted_preview=extracted[:600])
+        return WebsiteIntelResponse(
+            url=url,
+            bullets=fallback_bullets[:4],
+            extracted_preview=extracted[:600],
+        )
 
 
 @app.post("/intel/website/deep", response_model=WebsiteDeepIntelResponse)
@@ -699,7 +710,7 @@ async def website_intelligence_deep(req: WebsiteIntelRequest):
         raise HTTPException(status_code=502, detail=f"Failed to load homepage: {e}")
 
     internal_links = extract_internal_links(home_html, root_url)
-    pages_to_scan = [root_url] + internal_links[:6]
+    pages_to_scan = [root_url] + internal_links[:2]
 
     page_texts = []
     scanned_pages = []
@@ -715,6 +726,12 @@ async def website_intelligence_deep(req: WebsiteIntelRequest):
             print(f"[deep-intel] Failed on {page_url}: {e}")
 
     combined_text = "\n\n".join(page_texts)[:20000]
+
+    if not combined_text.strip():
+        raise HTTPException(
+            status_code=504,
+            detail="Deep intel timed out or extracted no usable page text.",
+        )
 
     prompt = f"""
 You are a commercial analyst helping a payments sales agent prepare for a live call.
