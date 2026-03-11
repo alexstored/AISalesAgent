@@ -101,7 +101,7 @@ def extract_site_text(html: str) -> str:
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
 
-    title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+    title = soup.title.string.strip() if soup.title and soup.title.string else ""
     meta_desc = ""
     meta = soup.find("meta", attrs={"name": "description"})
     if meta and meta.get("content"):
@@ -143,12 +143,14 @@ def safe_domain(url: str) -> str:
 
 async def fetch_rendered_html(url: str) -> str:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(user_agent=USER_AGENT)
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        html = await page.content()
-        await browser.close()
-        return html
+        browser = await p.chromium.launch(channel="chromium", headless=True)
+        try:
+            page = await browser.new_page(user_agent=USER_AGENT)
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            html = await page.content()
+            return html
+        finally:
+            await browser.close()
 
 
 def extract_internal_links(html: str, base_url: str) -> List[str]:
@@ -160,7 +162,7 @@ def extract_internal_links(html: str, base_url: str) -> List[str]:
         "about", "service", "services", "product", "products", "pricing",
         "menu", "book", "booking", "reservation", "contact", "faq",
         "order", "delivery", "checkout", "shop", "payments", "pay",
-        "invoice", "subscriptions", "plans"
+        "invoice", "subscriptions", "plans",
     ]
 
     for a in soup.find_all("a", href=True):
@@ -313,7 +315,7 @@ async def hubspot_search_contact_by_phone(phone_raw: str) -> Optional[Dict[str, 
             if r.status_code == 401:
                 raise HTTPException(
                     status_code=500,
-                    detail="HubSpot auth failed (check HUBSPOT_PRIVATE_APP_TOKEN)."
+                    detail="HubSpot auth failed (check HUBSPOT_PRIVATE_APP_TOKEN).",
                 )
 
             if r.status_code == 400:
