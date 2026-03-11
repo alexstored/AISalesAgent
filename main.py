@@ -51,7 +51,7 @@ HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID = os.getenv(
 # =========================
 # App + CORS
 # =========================
-app = FastAPI(title="StoredAI Backend", version="0.2.0")
+app = FastAPI(title="StoredAI Backend", version="0.2.1")
 
 origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip() and "*" not in o]
 origin_regex = r"^https://.*\.vercel\.app$"
@@ -141,7 +141,7 @@ def extract_site_text(html: str) -> str:
 
 
 def safe_domain(url: str) -> str:
-    url = url.strip()
+    url = (url or "").strip()
     if not url:
         return ""
     if not url.startswith("http://") and not url.startswith("https://"):
@@ -221,6 +221,39 @@ def extract_main_text(html: str, url: str) -> str:
         include_comments=False,
     )
     return (text or "").strip()
+
+
+def is_call_active(state: Optional[str], external_number: Optional[str], active_flag: Optional[bool]) -> bool:
+    """
+    Normalise upstream CT API states into the legacy frontend expectation.
+    """
+    if active_flag is True and external_number:
+        return True
+
+    state_norm = (state or "").strip().lower()
+    return state_norm in {"ringing", "answered", "connected", "active", "in_progress"} and bool(external_number)
+
+
+def build_legacy_pull_response(
+    *,
+    active: bool,
+    external_number: str = "",
+    hubspot_contact: Optional[Dict[str, Any]] = None,
+    hubspot_company: Optional[Dict[str, Any]] = None,
+    website: str = "",
+):
+    """
+    Return the exact response shape the old frontend expects.
+    """
+    return {
+        "call": {
+            "active": bool(active),
+            "external_number": external_number or "",
+        },
+        "hubspot_contact": hubspot_contact or {},
+        "hubspot_company": hubspot_company or {},
+        "website": website or "",
+    }
 
 
 # =========================
@@ -472,38 +505,45 @@ class PullCallResponse(BaseModel):
     updated_at: Optional[int] = None
 
 
+class LegacyCallPayload(BaseModel):
+    active: bool
+    external_number: str = ""
+
+
 class HubSpotContact(BaseModel):
-    id: str
     firstname: Optional[str] = None
     lastname: Optional[str] = None
     email: Optional[str] = None
     phone: Optional[str] = None
     mobilephone: Optional[str] = None
+    company: Optional[str] = None
     website: Optional[str] = None
     address: Optional[str] = None
     city: Optional[str] = None
     zip: Optional[str] = None
     country: Optional[str] = None
+    hs_object_id: Optional[str] = None
 
 
 class HubSpotCompany(BaseModel):
-    id: str
     name: Optional[str] = None
     domain: Optional[str] = None
     website: Optional[str] = None
+    phone: Optional[str] = None
     address: Optional[str] = None
     city: Optional[str] = None
     zip: Optional[str] = None
     country: Optional[str] = None
     industry: Optional[str] = None
     description: Optional[str] = None
+    hs_object_id: Optional[str] = None
 
 
 class PullCallEnrichedResponse(BaseModel):
-    call: PullCallResponse
-    hubspot_contact: Optional[HubSpotContact] = None
-    hubspot_company: Optional[HubSpotCompany] = None
-    website: Optional[str] = None
+    call: LegacyCallPayload
+    hubspot_contact: Dict[str, Any] = Field(default_factory=dict)
+    hubspot_company: Dict[str, Any] = Field(default_factory=dict)
+    website: str = ""
 
 
 class WebsiteIntelRequest(BaseModel):
@@ -583,7 +623,16 @@ async def get_current_call(agent_id: str = Query(..., min_length=1)):
 
         r.raise_for_status()
         data = r.json()
-        return PullCallResponse(**data)
+
+        return PullCallResponse(
+            agent_id=str(data.get("agent_id", agent_id)),
+            active=bool(data.get("active", False)),
+            state=data.get("state"),
+            external_number=data.get("external_number"),
+            call_uuid=data.get("call_uuid"),
+            age_seconds=data.get("age_seconds"),
+            updated_at=data.get("updated_at"),
+        )
 
     except httpx.ReadTimeout:
         return PullCallResponse(
@@ -611,51 +660,98 @@ async def get_current_call(agent_id: str = Query(..., min_length=1)):
 
 @app.get("/call/pull", response_model=PullCallEnrichedResponse)
 async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
+    """
+    Legacy frontend-compatible endpoint.
+
+    Always returns:
+    {
+      "call": {
+        "active": bool,
+        "external_number": "..."
+      },
+      "hubspot_contact": {...},
+      "hubspot_company": {...},
+      "website": "..."
+    }
+    """
     try:
-        call = await get_current_call(agent_id)
+        current_call = await get_current_call(agent_id)
     except HTTPException:
-        return PullCallEnrichedResponse(
-            call=PullCallResponse(
-                agent_id=agent_id,
-                active=False,
-                state="unavailable",
-            )
+        return build_legacy_pull_response(
+            active=False,
+            external_number="",
+            hubspot_contact={},
+            hubspot_company={},
+            website="",
         )
 
-    if not call.active or not call.external_number:
-        return PullCallEnrichedResponse(call=call)
+    active = is_call_active(
+        state=current_call.state,
+        external_number=current_call.external_number,
+        active_flag=current_call.active,
+    )
+
+    external_number = current_call.external_number or ""
+
+    if not active or not external_number:
+        return build_legacy_pull_response(
+            active=False,
+            external_number="",
+            hubspot_contact={},
+            hubspot_company={},
+            website="",
+        )
 
     if not HUBSPOT_PRIVATE_APP_TOKEN:
-        return PullCallEnrichedResponse(call=call)
+        return build_legacy_pull_response(
+            active=True,
+            external_number=external_number,
+            hubspot_contact={},
+            hubspot_company={},
+            website="",
+        )
 
     try:
-        found = await hubspot_search_contact_by_phone(call.external_number)
+        found = await hubspot_search_contact_by_phone(external_number)
         if not found:
-            return PullCallEnrichedResponse(call=call, website=None)
+            return build_legacy_pull_response(
+                active=True,
+                external_number=external_number,
+                hubspot_contact={},
+                hubspot_company={},
+                website="",
+            )
 
         contact_id = found.get("id")
         if not contact_id:
-            return PullCallEnrichedResponse(call=call, website=None)
+            return build_legacy_pull_response(
+                active=True,
+                external_number=external_number,
+                hubspot_contact={},
+                hubspot_company={},
+                website="",
+            )
 
         contact_obj = await hubspot_get_contact(contact_id)
         props = contact_obj.get("properties", {}) or {}
 
-        contact = HubSpotContact(
-            id=contact_id,
-            firstname=props.get("firstname"),
-            lastname=props.get("lastname"),
-            email=props.get("email"),
-            phone=props.get("phone"),
-            mobilephone=props.get("mobilephone"),
-            website=props.get("website"),
-            address=props.get("address"),
-            city=props.get("city"),
-            zip=props.get("zip"),
-            country=props.get("country"),
-        )
+        contact = {
+            "firstname": props.get("firstname") or "",
+            "lastname": props.get("lastname") or "",
+            "email": props.get("email") or "",
+            "phone": props.get("phone") or "",
+            "mobilephone": props.get("mobilephone") or "",
+            "company": props.get("company") or "",
+            "website": props.get("website") or "",
+            "address": props.get("address") or "",
+            "city": props.get("city") or "",
+            "zip": props.get("zip") or "",
+            "country": props.get("country") or "",
+            "hs_object_id": props.get("hs_object_id") or contact_id,
+        }
 
-        company = None
-        website = contact.website or None
+        company: Dict[str, Any] = {}
+        website = contact.get("website") or ""
 
         try:
             company_id = await hubspot_get_associated_company_id(contact_id)
@@ -663,20 +759,21 @@ async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
                 company_obj = await hubspot_get_company(company_id)
                 cprops = company_obj.get("properties", {}) or {}
 
-                company = HubSpotCompany(
-                    id=company_id,
-                    name=cprops.get("name"),
-                    domain=cprops.get("domain"),
-                    website=cprops.get("website"),
-                    address=cprops.get("address"),
-                    city=cprops.get("city"),
-                    zip=cprops.get("zip"),
-                    country=cprops.get("country"),
-                    industry=cprops.get("industry"),
-                    description=cprops.get("description"),
-                )
+                company = {
+                    "name": cprops.get("name") or "",
+                    "domain": cprops.get("domain") or "",
+                    "website": cprops.get("website") or "",
+                    "phone": cprops.get("phone") or "",
+                    "address": cprops.get("address") or "",
+                    "city": cprops.get("city") or "",
+                    "zip": cprops.get("zip") or "",
+                    "country": cprops.get("country") or "",
+                    "industry": cprops.get("industry") or "",
+                    "description": cprops.get("description") or "",
+                    "hs_object_id": cprops.get("hs_object_id") or company_id,
+                }
 
-                website = website or company.website or company.domain
+                website = website or company.get("website") or company.get("domain") or ""
 
         except Exception as company_err:
             print(f"[call/pull] Company enrichment failed: {company_err}")
@@ -684,8 +781,9 @@ async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
         if website:
             website = safe_domain(website)
 
-        return PullCallEnrichedResponse(
-            call=call,
+        return build_legacy_pull_response(
+            active=True,
+            external_number=external_number,
             hubspot_contact=contact,
             hubspot_company=company,
             website=website,
@@ -693,7 +791,13 @@ async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
 
     except Exception as e:
         print(f"[call/pull] HubSpot enrichment failed: {e}")
-        return PullCallEnrichedResponse(call=call)
+        return build_legacy_pull_response(
+            active=True,
+            external_number=external_number,
+            hubspot_contact={},
+            hubspot_company={},
+            website="",
+        )
 
 
 @app.post("/intel/website", response_model=WebsiteIntelResponse)
