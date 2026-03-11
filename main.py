@@ -44,7 +44,9 @@ INTEL_MAX_CHARS = int(os.getenv("INTEL_MAX_CHARS", "6000"))
 INTEL_USE_AI = os.getenv("INTEL_USE_AI", "true").lower() == "true"
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4.1-mini")
 
-HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID = os.getenv("HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID")
+HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID = os.getenv(
+    "HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID"
+)
 
 # =========================
 # App + CORS
@@ -84,12 +86,18 @@ def normalize_phone(raw: str) -> Tuple[str, str, str]:
 
 def require_env(name: str, value: Optional[str]) -> str:
     if not value:
-        raise HTTPException(status_code=500, detail=f"Missing required server env var: {name}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing required server env var: {name}",
+        )
     return value
 
 
 async def http_get_text(url: str, headers: Optional[Dict[str, str]] = None) -> str:
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT,
+        follow_redirects=True,
+    ) as client:
         r = await client.get(url, headers=headers)
         r.raise_for_status()
         return r.text
@@ -158,10 +166,27 @@ def extract_internal_links(html: str, base_url: str) -> List[str]:
     links = []
 
     keywords = [
-        "about", "service", "services", "product", "products", "pricing",
-        "menu", "book", "booking", "reservation", "contact", "faq",
-        "order", "delivery", "checkout", "shop", "payments", "pay",
-        "invoice", "subscriptions", "plans",
+        "about",
+        "service",
+        "services",
+        "product",
+        "products",
+        "pricing",
+        "menu",
+        "book",
+        "booking",
+        "reservation",
+        "contact",
+        "faq",
+        "order",
+        "delivery",
+        "checkout",
+        "shop",
+        "payments",
+        "pay",
+        "invoice",
+        "subscriptions",
+        "plans",
     ]
 
     for a in soup.find_all("a", href=True):
@@ -234,78 +259,90 @@ async def hubspot_search_contact_by_phone(phone_raw: str) -> Optional[Dict[str, 
     search_attempts: List[Dict[str, Any]] = []
 
     if e164:
-        search_attempts.append({
+        search_attempts.append(
+            {
+                "filterGroups": [{
+                    "filters": [{
+                        "propertyName": "phone",
+                        "operator": "EQ",
+                        "value": e164,
+                    }]
+                }],
+                "properties": properties,
+                "limit": 1,
+            }
+        )
+
+        search_attempts.append(
+            {
+                "filterGroups": [{
+                    "filters": [{
+                        "propertyName": "mobilephone",
+                        "operator": "EQ",
+                        "value": e164,
+                    }]
+                }],
+                "properties": properties,
+                "limit": 1,
+            }
+        )
+
+    search_attempts.append(
+        {
             "filterGroups": [{
                 "filters": [{
                     "propertyName": "phone",
                     "operator": "EQ",
-                    "value": e164,
+                    "value": digits,
                 }]
             }],
             "properties": properties,
             "limit": 1,
-        })
+        }
+    )
 
-        search_attempts.append({
+    search_attempts.append(
+        {
             "filterGroups": [{
                 "filters": [{
                     "propertyName": "mobilephone",
                     "operator": "EQ",
-                    "value": e164,
+                    "value": digits,
                 }]
             }],
             "properties": properties,
             "limit": 1,
-        })
-
-    search_attempts.append({
-        "filterGroups": [{
-            "filters": [{
-                "propertyName": "phone",
-                "operator": "EQ",
-                "value": digits,
-            }]
-        }],
-        "properties": properties,
-        "limit": 1,
-    })
-
-    search_attempts.append({
-        "filterGroups": [{
-            "filters": [{
-                "propertyName": "mobilephone",
-                "operator": "EQ",
-                "value": digits,
-            }]
-        }],
-        "properties": properties,
-        "limit": 1,
-    })
+        }
+    )
 
     if last10:
-        search_attempts.append({
-            "filterGroups": [{
-                "filters": [{
-                    "propertyName": "phone",
-                    "operator": "CONTAINS_TOKEN",
-                    "value": last10,
-                }]
-            }],
-            "properties": properties,
-            "limit": 1,
-        })
+        search_attempts.append(
+            {
+                "filterGroups": [{
+                    "filters": [{
+                        "propertyName": "phone",
+                        "operator": "CONTAINS_TOKEN",
+                        "value": last10,
+                    }]
+                }],
+                "properties": properties,
+                "limit": 1,
+            }
+        )
 
-        search_attempts.append({
-            "filterGroups": [{
-                "filters": [{
-                    "propertyName": "mobilephone",
-                    "operator": "CONTAINS_TOKEN",
-                    "value": last10,
-                }]
-            }],
-            "properties": properties,
-            "limit": 1,
-        })
+        search_attempts.append(
+            {
+                "filterGroups": [{
+                    "filters": [{
+                        "propertyName": "mobilephone",
+                        "operator": "CONTAINS_TOKEN",
+                        "value": last10,
+                    }]
+                }],
+                "properties": properties,
+                "limit": 1,
+            }
+        )
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         for payload in search_attempts:
@@ -336,20 +373,22 @@ async def hubspot_search_contact_by_phone(phone_raw: str) -> Optional[Dict[str, 
 async def hubspot_get_contact(contact_id: str) -> Dict[str, Any]:
     url = f"https://api.hubapi.com/crm/v3/objects/contacts/{contact_id}"
     params = {
-        "properties": ",".join([
-            "firstname",
-            "lastname",
-            "email",
-            "phone",
-            "mobilephone",
-            "company",
-            "website",
-            "address",
-            "city",
-            "zip",
-            "country",
-            "hs_object_id",
-        ])
+        "properties": ",".join(
+            [
+                "firstname",
+                "lastname",
+                "email",
+                "phone",
+                "mobilephone",
+                "company",
+                "website",
+                "address",
+                "city",
+                "zip",
+                "country",
+                "hs_object_id",
+            ]
+        )
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         r = await client.get(url, headers=hubspot_headers(), params=params)
@@ -370,19 +409,21 @@ async def hubspot_get_associated_company_id(contact_id: str) -> Optional[str]:
 async def hubspot_get_company(company_id: str) -> Dict[str, Any]:
     url = f"https://api.hubapi.com/crm/v3/objects/companies/{company_id}"
     params = {
-        "properties": ",".join([
-            "name",
-            "domain",
-            "website",
-            "phone",
-            "address",
-            "city",
-            "zip",
-            "country",
-            "industry",
-            "description",
-            "hs_object_id",
-        ])
+        "properties": ",".join(
+            [
+                "name",
+                "domain",
+                "website",
+                "phone",
+                "address",
+                "city",
+                "zip",
+                "country",
+                "industry",
+                "description",
+                "hs_object_id",
+            ]
+        )
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         r = await client.get(url, headers=hubspot_headers(), params=params)
@@ -524,16 +565,62 @@ def health():
 @app.get("/call/current", response_model=PullCallResponse)
 async def get_current_call(agent_id: str = Query(..., min_length=1)):
     url = f"{CT_STATE_API_BASE}/agents/{agent_id}/current-call"
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(url)
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(url)
+
+        if r.status_code == 429:
+            return PullCallResponse(
+                agent_id=agent_id,
+                active=False,
+                state="rate_limited",
+                external_number=None,
+                call_uuid=None,
+                age_seconds=None,
+                updated_at=None,
+            )
+
         r.raise_for_status()
         data = r.json()
-    return PullCallResponse(**data)
+        return PullCallResponse(**data)
+
+    except httpx.ReadTimeout:
+        return PullCallResponse(
+            agent_id=agent_id,
+            active=False,
+            state="timeout",
+            external_number=None,
+            call_uuid=None,
+            age_seconds=None,
+            updated_at=None,
+        )
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"CT state API returned {e.response.status_code}",
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"CT state API failed: {str(e)}",
+        )
 
 
 @app.get("/call/pull", response_model=PullCallEnrichedResponse)
 async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
-    call = await get_current_call(agent_id)
+    try:
+        call = await get_current_call(agent_id)
+    except HTTPException:
+        return PullCallEnrichedResponse(
+            call=PullCallResponse(
+                agent_id=agent_id,
+                active=False,
+                state="unavailable",
+            )
+        )
 
     if not call.active or not call.external_number:
         return PullCallEnrichedResponse(call=call)
@@ -782,7 +869,11 @@ async def get_sales_advice(req: AdviceRequest):
     if not openai_client:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured on server.")
 
-    website_bits = "\n".join([f"- {b}" for b in req.website_bullets[:8]]) if req.website_bullets else "- (none)"
+    website_bits = (
+        "\n".join([f"- {b}" for b in req.website_bullets[:8]])
+        if req.website_bullets
+        else "- (none)"
+    )
     provider = req.provider or "(unknown)"
     pricing = req.pricing_context or "(not provided)"
     extra = req.extra_context or ""
@@ -835,10 +926,11 @@ Return ONLY valid JSON like:
 async def save_notes_to_hubspot(req: SaveNotesRequest):
     require_env("HUBSPOT_PRIVATE_APP_TOKEN", HUBSPOT_PRIVATE_APP_TOKEN)
 
+    notes_html = (req.notes or "").replace("\n", "<br/>")
     body_html = f"""
 <p><strong>Call UUID:</strong> {req.call_uuid or ""}</p>
 <p><strong>Notes:</strong></p>
-<p>{(req.notes or "").replace("\\n", "<br/>")}</p>
+<p>{notes_html}</p>
 """.strip()
 
     note = await hubspot_create_note(body_html)
