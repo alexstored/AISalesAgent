@@ -18,19 +18,14 @@ from openai import OpenAI
 # =========================
 load_dotenv()
 
-# --- Required for HubSpot flows ---
 HUBSPOT_PRIVATE_APP_TOKEN = os.getenv("HUBSPOT_PRIVATE_APP_TOKEN")
-
-# --- Required for AI advice (server-side only) ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# --- Your existing Render service that stores current call state ---
 CT_STATE_API_BASE = os.getenv(
     "CT_STATE_API_BASE",
     "https://new-ct-number-pull.onrender.com",
 ).rstrip("/")
 
-# --- CORS (allow your Vercel app + localhost) ---
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "http://localhost:3000",
@@ -42,14 +37,10 @@ USER_AGENT = os.getenv(
     "StoredAI/1.0 (+https://stored.ai)",
 )
 
-# Website intel settings
 INTEL_MAX_CHARS = int(os.getenv("INTEL_MAX_CHARS", "6000"))
 INTEL_USE_AI = os.getenv("INTEL_USE_AI", "true").lower() == "true"
-
-# AI settings
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4.1-mini")
 
-# Optional: HubSpot note association type id (varies by portal/object model)
 HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID = os.getenv("HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID")
 
 # =========================
@@ -57,10 +48,7 @@ HUBSPOT_NOTE_TO_CONTACT_ASSOC_TYPE_ID = os.getenv("HUBSPOT_NOTE_TO_CONTACT_ASSOC
 # =========================
 app = FastAPI(title="StoredAI Backend", version="0.1.0")
 
-# Explicit origins from env
 origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip() and "*" not in o]
-
-# Regex for Vercel preview/prod domains
 origin_regex = r"^https://.*\.vercel\.app$"
 
 app.add_middleware(
@@ -77,21 +65,16 @@ app.add_middleware(
 # =========================
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-
 # =========================
 # Helpers
 # =========================
 def normalize_phone(raw: str) -> Tuple[str, str, str]:
-    """
-    Returns: (e164_like, digits_only, last10)
-    """
     raw = (raw or "").strip()
     digits = re.sub(r"\D+", "", raw)
     if raw.startswith("+"):
         e164 = "+" + digits
     else:
         e164 = "+" + digits if digits else ""
-
     last10 = digits[-10:] if len(digits) >= 10 else digits
     return e164, digits, last10
 
@@ -168,8 +151,8 @@ def hubspot_headers() -> Dict[str, str]:
 
 async def hubspot_search_contact_by_phone(phone_raw: str) -> Optional[Dict[str, Any]]:
     """
-    Attempts multiple matching strategies across phone fields.
-    Returns the first match's object summary (id + properties).
+    Search HubSpot contacts by phone using simple exact searches first.
+    Returns the first matching result or None.
     """
     e164, digits, last10 = normalize_phone(phone_raw)
     if not digits:
@@ -177,19 +160,127 @@ async def hubspot_search_contact_by_phone(phone_raw: str) -> Optional[Dict[str, 
 
     url = "https://api.hubapi.com/crm/v3/objects/contacts/search"
 
-    filter_groups = []
+    properties = [
+        "email",
+        "firstname",
+        "lastname",
+        "phone",
+        "mobilephone",
+        "company",
+        "website",
+        "address",
+        "city",
+        "zip",
+        "country",
+        "hs_object_id",
+    ]
 
-    for prop in ["phone", "mobilephone"]:
-        if e164:
-            filter_groups.append({"filters": [{"propertyName": prop, "operator": "EQ", "value": e164}]})
-        filter_groups.append({"filters": [{"propertyName": prop, "operator": "EQ", "value": digits}]})
+    search_attempts: List[Dict[str, Any]] = []
 
-    for prop in ["phone", "mobilephone"]:
-        filter_groups.append({"filters": [{"propertyName": prop, "operator": "CONTAINS_TOKEN", "value": last10}]})
+    if e164:
+        search_attempts.append({
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "phone",
+                    "operator": "EQ",
+                    "value": e164,
+                }]
+            }],
+            "properties": properties,
+            "limit": 1,
+        })
 
-    payload = {
-        "filterGroups": filter_groups,
-        "properties": [
+        search_attempts.append({
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "mobilephone",
+                    "operator": "EQ",
+                    "value": e164,
+                }]
+            }],
+            "properties": properties,
+            "limit": 1,
+        })
+
+    search_attempts.append({
+        "filterGroups": [{
+            "filters": [{
+                "propertyName": "phone",
+                "operator": "EQ",
+                "value": digits,
+            }]
+        }],
+        "properties": properties,
+        "limit": 1,
+    })
+
+    search_attempts.append({
+        "filterGroups": [{
+            "filters": [{
+                "propertyName": "mobilephone",
+                "operator": "EQ",
+                "value": digits,
+            }]
+        }],
+        "properties": properties,
+        "limit": 1,
+    })
+
+    if last10:
+        search_attempts.append({
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "phone",
+                    "operator": "CONTAINS_TOKEN",
+                    "value": last10,
+                }]
+            }],
+            "properties": properties,
+            "limit": 1,
+        })
+
+        search_attempts.append({
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "mobilephone",
+                    "operator": "CONTAINS_TOKEN",
+                    "value": last10,
+                }]
+            }],
+            "properties": properties,
+            "limit": 1,
+        })
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        for payload in search_attempts:
+            r = await client.post(url, headers=hubspot_headers(), json=payload)
+
+            if r.status_code == 401:
+                raise HTTPException(
+                    status_code=500,
+                    detail="HubSpot auth failed (check HUBSPOT_PRIVATE_APP_TOKEN)."
+                )
+
+            if r.status_code == 400:
+                print("[hubspot_search_contact_by_phone] 400 payload rejected:")
+                print(json.dumps(payload, indent=2))
+                print("[hubspot_search_contact_by_phone] response body:")
+                print(r.text)
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+            results = data.get("results", [])
+            if results:
+                return results[0]
+
+    return None
+
+
+async def hubspot_get_contact(contact_id: str) -> Dict[str, Any]:
+    url = f"https://api.hubapi.com/crm/v3/objects/contacts/{contact_id}"
+    params = {
+        "properties": ",".join([
             "firstname",
             "lastname",
             "email",
@@ -201,40 +292,8 @@ async def hubspot_search_contact_by_phone(phone_raw: str) -> Optional[Dict[str, 
             "city",
             "zip",
             "country",
-        ],
-        "limit": 5,
-    }
-
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.post(url, headers=hubspot_headers(), json=payload)
-        if r.status_code == 401:
-            raise HTTPException(status_code=500, detail="HubSpot auth failed (check HUBSPOT_PRIVATE_APP_TOKEN).")
-        r.raise_for_status()
-        data = r.json()
-
-    results = data.get("results", [])
-    return results[0] if results else None
-
-
-async def hubspot_get_contact(contact_id: str) -> Dict[str, Any]:
-    url = f"https://api.hubapi.com/crm/v3/objects/contacts/{contact_id}"
-    params = {
-        "properties": ",".join(
-            [
-                "firstname",
-                "lastname",
-                "email",
-                "phone",
-                "mobilephone",
-                "company",
-                "website",
-                "address",
-                "city",
-                "zip",
-                "country",
-                "hs_object_id",
-            ]
-        )
+            "hs_object_id",
+        ])
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         r = await client.get(url, headers=hubspot_headers(), params=params)
@@ -255,21 +314,19 @@ async def hubspot_get_associated_company_id(contact_id: str) -> Optional[str]:
 async def hubspot_get_company(company_id: str) -> Dict[str, Any]:
     url = f"https://api.hubapi.com/crm/v3/objects/companies/{company_id}"
     params = {
-        "properties": ",".join(
-            [
-                "name",
-                "domain",
-                "website",
-                "phone",
-                "address",
-                "city",
-                "zip",
-                "country",
-                "industry",
-                "description",
-                "hs_object_id",
-            ]
-        )
+        "properties": ",".join([
+            "name",
+            "domain",
+            "website",
+            "phone",
+            "address",
+            "city",
+            "zip",
+            "country",
+            "industry",
+            "description",
+            "hs_object_id",
+        ])
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         r = await client.get(url, headers=hubspot_headers(), params=params)
@@ -306,7 +363,7 @@ async def hubspot_associate_note_to_contact(note_id: str, contact_id: str) -> No
 
 
 # =========================
-# Model (API contracts)
+# Models
 # =========================
 class PullCallResponse(BaseModel):
     agent_id: str
@@ -417,60 +474,75 @@ async def pull_call_and_enrich(agent_id: str = Query(..., min_length=1)):
     if not call.active or not call.external_number:
         return PullCallEnrichedResponse(call=call)
 
-    require_env("HUBSPOT_PRIVATE_APP_TOKEN", HUBSPOT_PRIVATE_APP_TOKEN)
+    if not HUBSPOT_PRIVATE_APP_TOKEN:
+        return PullCallEnrichedResponse(call=call)
 
-    found = await hubspot_search_contact_by_phone(call.external_number)
-    if not found:
-        return PullCallEnrichedResponse(call=call, website=None)
+    try:
+        found = await hubspot_search_contact_by_phone(call.external_number)
+        if not found:
+            return PullCallEnrichedResponse(call=call, website=None)
 
-    contact_id = found.get("id")
-    contact_obj = await hubspot_get_contact(contact_id)
-    props = contact_obj.get("properties", {}) or {}
+        contact_id = found.get("id")
+        if not contact_id:
+            return PullCallEnrichedResponse(call=call, website=None)
 
-    contact = HubSpotContact(
-        id=contact_id,
-        firstname=props.get("firstname"),
-        lastname=props.get("lastname"),
-        email=props.get("email"),
-        phone=props.get("phone"),
-        mobilephone=props.get("mobilephone"),
-        website=props.get("website"),
-        address=props.get("address"),
-        city=props.get("city"),
-        zip=props.get("zip"),
-        country=props.get("country"),
-    )
+        contact_obj = await hubspot_get_contact(contact_id)
+        props = contact_obj.get("properties", {}) or {}
 
-    company = None
-    website = contact.website or None
-
-    company_id = await hubspot_get_associated_company_id(contact_id)
-    if company_id:
-        company_obj = await hubspot_get_company(company_id)
-        cprops = company_obj.get("properties", {}) or {}
-        company = HubSpotCompany(
-            id=company_id,
-            name=cprops.get("name"),
-            domain=cprops.get("domain"),
-            website=cprops.get("website"),
-            address=cprops.get("address"),
-            city=cprops.get("city"),
-            zip=cprops.get("zip"),
-            country=cprops.get("country"),
-            industry=cprops.get("industry"),
-            description=cprops.get("description"),
+        contact = HubSpotContact(
+            id=contact_id,
+            firstname=props.get("firstname"),
+            lastname=props.get("lastname"),
+            email=props.get("email"),
+            phone=props.get("phone"),
+            mobilephone=props.get("mobilephone"),
+            website=props.get("website"),
+            address=props.get("address"),
+            city=props.get("city"),
+            zip=props.get("zip"),
+            country=props.get("country"),
         )
-        website = website or company.website or company.domain
 
-    if website:
-        website = safe_domain(website)
+        company = None
+        website = contact.website or None
 
-    return PullCallEnrichedResponse(
-        call=call,
-        hubspot_contact=contact,
-        hubspot_company=company,
-        website=website,
-    )
+        try:
+            company_id = await hubspot_get_associated_company_id(contact_id)
+            if company_id:
+                company_obj = await hubspot_get_company(company_id)
+                cprops = company_obj.get("properties", {}) or {}
+
+                company = HubSpotCompany(
+                    id=company_id,
+                    name=cprops.get("name"),
+                    domain=cprops.get("domain"),
+                    website=cprops.get("website"),
+                    address=cprops.get("address"),
+                    city=cprops.get("city"),
+                    zip=cprops.get("zip"),
+                    country=cprops.get("country"),
+                    industry=cprops.get("industry"),
+                    description=cprops.get("description"),
+                )
+
+                website = website or company.website or company.domain
+
+        except Exception as company_err:
+            print(f"[call/pull] Company enrichment failed: {company_err}")
+
+        if website:
+            website = safe_domain(website)
+
+        return PullCallEnrichedResponse(
+            call=call,
+            hubspot_contact=contact,
+            hubspot_company=company,
+            website=website,
+        )
+
+    except Exception as e:
+        print(f"[call/pull] HubSpot enrichment failed: {e}")
+        return PullCallEnrichedResponse(call=call)
 
 
 @app.post("/intel/website", response_model=WebsiteIntelResponse)
