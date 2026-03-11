@@ -306,7 +306,7 @@ async def hubspot_associate_note_to_contact(note_id: str, contact_id: str) -> No
 
 
 # =========================
-# Models (API contracts)
+# Model (API contracts)
 # =========================
 class PullCallResponse(BaseModel):
     agent_id: str
